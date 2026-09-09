@@ -7,6 +7,7 @@
 #include "esp_log.h"
 #include "esp_check.h"
 #include "esp_mac.h"
+#include "esp_eth_phy_ip101.h"
 #include "driver/gpio.h"
 #include "sdkconfig.h"
 #if CONFIG_EXAMPLE_USE_SPI_ETHERNET
