@@ -28,10 +28,9 @@
 #define min(a, b) (((a) < (b)) ? (a) : (b))
 #endif
 
-#include <libusb.h>
 #define LOG_LOCAL_LEVEL ESP_LOG_VERBOSE
+#include <libusb.h>
 #include "esp_log.h"
-
 
 #define TAG "librtlsdr"
 /*
@@ -1883,7 +1882,44 @@ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
 		dev->async_status = RTLSDR_CANCELING;
 	}
 	else {
-		for(i = 0; i < dev->xfer_buf_num; ++i) {
+		esp_err_t ep_err;
+
+		/*
+		 * Recover endpoint 0x81 before starting a new async stream.
+		 * On ESP-IDF the endpoint commands are asynchronous internally; issuing
+		 * halt/flush/clear back-to-back can therefore make clear() see an
+		 * invalid state. Give the host task time to complete each transition
+		 * and retry the sequence a few times before submitting URBs.
+		 */
+		bool ep_ready = false;
+		for (int attempt = 1; attempt <= 3; ++attempt) {
+			ep_err = usb_host_endpoint_halt(dev->devh, 0x81);
+			ESP_LOGI(TAG, "pre-stream[%d] halt ep81: %s", attempt, esp_err_to_name(ep_err));
+			vTaskDelay(pdMS_TO_TICKS(20));
+
+			ep_err = usb_host_endpoint_flush(dev->devh, 0x81);
+			ESP_LOGI(TAG, "pre-stream[%d] flush ep81: %s", attempt, esp_err_to_name(ep_err));
+			vTaskDelay(pdMS_TO_TICKS(20));
+
+			ep_err = usb_host_endpoint_clear(dev->devh, 0x81);
+			ESP_LOGI(TAG, "pre-stream[%d] clear ep81: %s", attempt, esp_err_to_name(ep_err));
+			if (ep_err == ESP_OK) {
+				ep_ready = true;
+				break;
+			}
+
+			vTaskDelay(pdMS_TO_TICKS(50));
+		}
+
+		if (!ep_ready) {
+			ESP_LOGE(TAG, "pre-stream endpoint recovery failed; not submitting URBs");
+			dev->async_status = RTLSDR_CANCELING;
+			r = ESP_ERR_INVALID_STATE;
+		}
+
+		vTaskDelay(pdMS_TO_TICKS(20));
+
+		if (ep_ready) for(i = 0; i < dev->xfer_buf_num; ++i) {
 			usb_transfer_t * xfer = dev->xfer[i];
 			xfer->callback =  _libusb_callback;
 			xfer->bEndpointAddress = 0x81;

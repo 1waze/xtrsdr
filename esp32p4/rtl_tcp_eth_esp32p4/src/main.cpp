@@ -22,6 +22,7 @@
 #include "freertos/semphr.h"
 //#include "driver/spi_master.h"
 #include "esp_eth.h"
+#define LOG_LOCAL_LEVEL ESP_LOG_VERBOSE
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_heap_caps.h"
@@ -53,8 +54,6 @@
 #include "convenience.h"
 
 #define TAG "main"
-#define LOG_LOCAL_LEVEL ESP_LOG_VERBOSE
-#include "esp_log.h"
 
 #define UART_NUM UART_NUM_0       
 #define UART_TX_PIN GPIO_NUM_17
@@ -81,10 +80,22 @@
 
 #define DEFAULT_PORT_STR "1234"
 #define DEFAULT_SAMPLE_RATE_HZ 240000
+
+/* Mobile Ethernet mode: ESP32-P4 is 192.168.50.1/24 and runs DHCP server. */
+#define MOBILE_ETH_IP_A 192
+#define MOBILE_ETH_IP_B 168
+#define MOBILE_ETH_IP_C 50
+#define MOBILE_ETH_IP_D 1
+
+/* Fixed IQ ring buffer.  Four 5120-byte USB callbacks are coalesced into one
+ * 20480-byte TCP chunk.  No malloc/free is performed while streaming. */
+#define IQ_USB_BLOCK_SIZE 5120
+#define IQ_BLOCKS_PER_CHUNK 4
+#define IQ_CHUNK_SIZE (IQ_USB_BLOCK_SIZE * IQ_BLOCKS_PER_CHUNK)
 #ifdef CONFIG_SPIRAM
-	#define DEFAULT_MAX_NUM_BUFFERS 500
+#define IQ_RING_SLOTS 24
 #else
-	#define DEFAULT_MAX_NUM_BUFFERS 50
+#define IQ_RING_SLOTS 8
 #endif
 
 static SOCKET s;
@@ -97,11 +108,12 @@ static pthread_mutex_t exit_cond_lock;
 static pthread_mutex_t ll_mutex;
 static pthread_cond_t cond;
 
-struct llist {
-	char *data;
-	size_t len;
-	struct llist *next;
-};
+static uint8_t *iq_ring = NULL;
+static size_t iq_ring_len[IQ_RING_SLOTS];
+static unsigned int iq_ring_head = 0;
+static unsigned int iq_ring_tail = 0;
+static unsigned int iq_ring_count = 0;
+static size_t iq_build_len = 0;
 
 typedef struct { /* structure size must be multiple of 2 bytes */
 	char magic[4];
@@ -113,8 +125,8 @@ static rtlsdr_dev_t *dev = NULL;
 
 static int enable_biastee = 0;
 static int global_numq = 0;
-static struct llist *ll_buffers = 0;
-static int llbuf_num = DEFAULT_MAX_NUM_BUFFERS;
+static unsigned long iq_dropped_blocks = 0;
+static unsigned long iq_completed_chunks = 0;
 
 static volatile int do_exit = 0;
 
@@ -124,17 +136,69 @@ static volatile int do_exit = 0;
 static void eth_event_handler(void *arg, esp_event_base_t event_base,
                               int32_t event_id, void *event_data)
 {
+    esp_netif_t *mobile_netif = (esp_netif_t *)arg;
     uint8_t mac_addr[6] = {0};
     /* we can get the ethernet driver handle from event data */
     esp_eth_handle_t eth_handle = *(esp_eth_handle_t *)event_data;
 
     switch (event_id) {
-    case ETHERNET_EVENT_CONNECTED:
+    case ETHERNET_EVENT_CONNECTED: {
         esp_eth_ioctl(eth_handle, ETH_CMD_G_MAC_ADDR, mac_addr);
         ESP_LOGI(TAG, "Ethernet Link Up");
         ESP_LOGI(TAG, "Ethernet HW Addr %02x:%02x:%02x:%02x:%02x:%02x",
                  mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
+
+        eth_speed_t speed;
+        eth_duplex_t duplex;
+
+        if (esp_eth_ioctl(eth_handle, ETH_CMD_G_SPEED, &speed) == ESP_OK) {
+            ESP_LOGI(TAG, "Ethernet speed: %s",
+                     speed == ETH_SPEED_100M ? "100 Mbps" :
+                     speed == ETH_SPEED_10M  ? "10 Mbps"  : "unknown");
+        } else {
+            ESP_LOGW(TAG, "Could not read Ethernet speed");
+        }
+
+        if (esp_eth_ioctl(eth_handle, ETH_CMD_G_DUPLEX_MODE, &duplex) == ESP_OK) {
+            ESP_LOGI(TAG, "Ethernet duplex: %s",
+                     duplex == ETH_DUPLEX_FULL ? "full" : "half");
+        } else {
+            ESP_LOGW(TAG, "Could not read Ethernet duplex mode");
+        }
+
+        /* Ethernet interfaces normally use a DHCP client. In mobile mode this
+         * netif was created with ESP_NETIF_DHCP_SERVER instead. Unlike the
+         * Wi-Fi AP default netif, the Ethernet event path does not implicitly
+         * start a DHCP server, so start it explicitly once the link is up. */
+        if (mobile_netif != NULL) {
+            esp_netif_dhcp_status_t dhcps_status = ESP_NETIF_DHCP_INIT;
+            esp_err_t st = esp_netif_dhcps_get_status(mobile_netif, &dhcps_status);
+            ESP_LOGD(TAG, "DHCP server status before start: err=%s status=%d",
+                     esp_err_to_name(st), (int)dhcps_status);
+
+            if (st == ESP_OK && dhcps_status != ESP_NETIF_DHCP_STARTED) {
+                esp_err_t err = esp_netif_dhcps_start(mobile_netif);
+                if (err == ESP_OK || err == ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED) {
+                    ESP_LOGI(TAG, "DHCP server started on 192.168.50.1");
+                } else {
+                    ESP_LOGE(TAG, "Failed to start DHCP server: %s (0x%x)",
+                             esp_err_to_name(err), (unsigned)err);
+                }
+            }
+
+            dhcps_status = ESP_NETIF_DHCP_INIT;
+            st = esp_netif_dhcps_get_status(mobile_netif, &dhcps_status);
+            ESP_LOGD(TAG, "DHCP server status after start: err=%s status=%d",
+                     esp_err_to_name(st), (int)dhcps_status);
+
+            esp_netif_ip_info_t info = {};
+            if (esp_netif_get_ip_info(mobile_netif, &info) == ESP_OK) {
+                ESP_LOGI(TAG, "Mobile ETH IP:" IPSTR " mask:" IPSTR " gw:" IPSTR,
+                         IP2STR(&info.ip), IP2STR(&info.netmask), IP2STR(&info.gw));
+            }
+        }
         break;
+    }
     case ETHERNET_EVENT_DISCONNECTED:
         ESP_LOGI(TAG, "Ethernet Link Down");
         break;
@@ -175,116 +239,122 @@ void sighandler(void){
 
 void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx)
 {
-	//led_state= !led_state;
-	//gpio_set_level(LED_GPIO, led_state);
-	if(!do_exit) {
-#ifdef CONFIG_SPIRAM 
-		struct llist *rpt = (struct llist*) heap_caps_malloc(sizeof(struct llist),MALLOC_CAP_SPIRAM);
-		rpt->data = (char*)heap_caps_malloc(len,MALLOC_CAP_SPIRAM);
-#else
-		struct llist *rpt = (struct llist*)malloc(sizeof(struct llist));
-		rpt->data = (char*)malloc(len);
-#endif
-		memcpy(rpt->data, buf, len);
-		rpt->len = len;
-		rpt->next = NULL;
+    if (do_exit)
+        return;
 
-		pthread_mutex_lock(&ll_mutex);
+    if (len > IQ_CHUNK_SIZE) {
+        iq_dropped_blocks++;
+        return;
+    }
 
-		if (ll_buffers == NULL) {
-			ll_buffers = rpt;
-		} else {
-			struct llist *cur = ll_buffers;
-			int num_queued = 0;
+    pthread_mutex_lock(&ll_mutex);
 
-			while (cur->next != NULL) {
-				cur = cur->next;
-				num_queued++;
-			}
+    /* The producer owns iq_ring_head until a complete chunk is published.
+     * If all published slots are occupied, drop the incoming USB block rather
+     * than overwriting a slot which the TCP worker may currently be sending. */
+    if (iq_ring_count >= IQ_RING_SLOTS) {
+        iq_dropped_blocks++;
+        pthread_mutex_unlock(&ll_mutex);
+        return;
+    }
 
-			if(llbuf_num && llbuf_num == num_queued-2){
-				struct llist *curelem;
+    /* Normally len is 5120.  If a callback would cross the chunk boundary,
+     * publish the partial chunk first and continue in the next slot. */
+    if (iq_build_len + len > IQ_CHUNK_SIZE) {
+        iq_ring_len[iq_ring_head] = iq_build_len;
+        iq_ring_head = (iq_ring_head + 1) % IQ_RING_SLOTS;
+        iq_ring_count++;
+        iq_completed_chunks++;
+        iq_build_len = 0;
+        pthread_cond_signal(&cond);
 
-				free(ll_buffers->data);
-				curelem = ll_buffers->next;
-				free(ll_buffers);
-				ll_buffers = curelem;
-			}
+        if (iq_ring_count >= IQ_RING_SLOTS) {
+            iq_dropped_blocks++;
+            pthread_mutex_unlock(&ll_mutex);
+            return;
+        }
+    }
 
-			cur->next = rpt;
+    memcpy(iq_ring + ((size_t)iq_ring_head * IQ_CHUNK_SIZE) + iq_build_len, buf, len);
+    iq_build_len += len;
 
-			if (num_queued > global_numq)
-				printf("ll+, now %d\n", num_queued);
-			else if (num_queued < global_numq)
-				printf("ll-, now %d\n", num_queued);
+    if (iq_build_len == IQ_CHUNK_SIZE) {
+        iq_ring_len[iq_ring_head] = iq_build_len;
+        iq_ring_head = (iq_ring_head + 1) % IQ_RING_SLOTS;
+        iq_ring_count++;
+        iq_completed_chunks++;
+        iq_build_len = 0;
 
-			global_numq = num_queued;
-		}
-		pthread_cond_signal(&cond);
-		pthread_mutex_unlock(&ll_mutex);
-	}
+        if ((int)iq_ring_count > global_numq) {
+            global_numq = (int)iq_ring_count;
+            ESP_LOGD(TAG, "IQ ring high-water: %d/%d", global_numq, IQ_RING_SLOTS);
+        }
+        pthread_cond_signal(&cond);
+    }
+
+    pthread_mutex_unlock(&ll_mutex);
 }
+
 
 
 
 static void *tcp_worker(void *arg)
 {
-	struct llist *curelem,*prev;
-	int bytesleft,bytessent, index;
-	struct timeval tv= {1,0};
-	struct timespec ts;
-	struct timeval tp;
-	fd_set writefds;
-	int r = 0;
+    struct timespec ts;
+    struct timeval tp;
+    int r = 0;
 
-	while(1) {
-		if(do_exit)
-			pthread_exit(0);
+    while (1) {
+        if (do_exit)
+            pthread_exit(0);
 
-		pthread_mutex_lock(&ll_mutex);
-		gettimeofday(&tp, NULL);
-		ts.tv_sec  = tp.tv_sec+5;
-		ts.tv_nsec = tp.tv_usec * 1000;
-		r = pthread_cond_timedwait(&cond, &ll_mutex, &ts);
-		if(r == ETIMEDOUT) {
-			pthread_mutex_unlock(&ll_mutex);
-			printf("worker cond timeout\n");
-			sighandler();
-			pthread_exit(NULL);
-		}
+        pthread_mutex_lock(&ll_mutex);
+        while (iq_ring_count == 0 && !do_exit) {
+            gettimeofday(&tp, NULL);
+            ts.tv_sec = tp.tv_sec + 5;
+            ts.tv_nsec = tp.tv_usec * 1000;
+            r = pthread_cond_timedwait(&cond, &ll_mutex, &ts);
+            if (r == ETIMEDOUT && iq_ring_count == 0) {
+                pthread_mutex_unlock(&ll_mutex);
+                ESP_LOGW(TAG, "IQ worker timeout");
+                sighandler();
+                pthread_exit(NULL);
+            }
+        }
+        if (do_exit) {
+            pthread_mutex_unlock(&ll_mutex);
+            pthread_exit(0);
+        }
 
-		curelem = ll_buffers;
-		ll_buffers = 0;
-		pthread_mutex_unlock(&ll_mutex);
+        /* Keep this slot reserved while send() is using it. The producer
+         * cannot overwrite it even if TCP blocks briefly. */
+        unsigned int slot = iq_ring_tail;
+        size_t chunk_len = iq_ring_len[slot];
+        pthread_mutex_unlock(&ll_mutex);
 
-		while(curelem != 0) {
-			bytesleft = curelem->len;
-			index = 0;
-			bytessent = 0;
-			while(bytesleft > 0) {
-				FD_ZERO(&writefds);
-				FD_SET(s, &writefds);
-				tv.tv_sec = 1;
-				tv.tv_usec = 0;
-				r = select(s+1, NULL, &writefds, NULL, &tv);
-				if(r) {
-					bytessent = send(s,  &curelem->data[index], bytesleft, 0);
-					bytesleft -= bytessent;
-					index += bytessent;
-				}
-				if(bytessent == SOCKET_ERROR || do_exit) {
-						printf("worker socket bye\n");
-						sighandler();
-						pthread_exit(NULL);
-				}
-			}
-			prev = curelem;
-			curelem = curelem->next;
-			free(prev->data);
-			free(prev);
-		}
-	}
+        size_t offset = 0;
+        while (offset < chunk_len) {
+            ssize_t sent = send(s,
+                                iq_ring + ((size_t)slot * IQ_CHUNK_SIZE) + offset,
+                                chunk_len - offset,
+                                0);
+            if (sent <= 0 || do_exit) {
+                ESP_LOGI(TAG, "TCP client disconnected");
+                sighandler();
+                pthread_exit(NULL);
+            }
+            offset += (size_t)sent;
+        }
+
+        pthread_mutex_lock(&ll_mutex);
+        iq_ring_len[slot] = 0;
+        iq_ring_tail = (iq_ring_tail + 1) % IQ_RING_SLOTS;
+        if (iq_ring_count > 0)
+            iq_ring_count--;
+        pthread_mutex_unlock(&ll_mutex);
+    }
 }
+
 
 static int set_gain_by_index(rtlsdr_dev_t *_dev, unsigned int index)
 {
@@ -340,60 +410,60 @@ static void *command_worker(void *arg)
 		}
 		switch(cmd.cmd) {
 		case 0x01:
-			printf("set freq %d\n", ntohl(cmd.param));
+			ESP_LOGD(TAG, "set freq %lu", (unsigned long)ntohl(cmd.param));
 			rtlsdr_set_center_freq(dev,ntohl(cmd.param));
 			break;
 		case 0x02:
-			printf("set sample rate %d\n", ntohl(cmd.param));
+			ESP_LOGD(TAG, "set sample rate %lu", (unsigned long)ntohl(cmd.param));
 			rtlsdr_set_sample_rate(dev, ntohl(cmd.param));
 			break;
 		case 0x03:
-			printf("set gain mode %d\n", ntohl(cmd.param));
+			ESP_LOGD(TAG, "set gain mode %lu", (unsigned long)ntohl(cmd.param));
 			rtlsdr_set_tuner_gain_mode(dev, ntohl(cmd.param));
 			break;
 		case 0x04:
-			printf("set gain %d\n", ntohl(cmd.param));
+			ESP_LOGD(TAG, "set gain %lu", (unsigned long)ntohl(cmd.param));
 			rtlsdr_set_tuner_gain(dev, ntohl(cmd.param));
 			break;
 		case 0x05:
-			printf("set freq correction %d\n", ntohl(cmd.param));
+			ESP_LOGD(TAG, "set freq correction %lu", (unsigned long)ntohl(cmd.param));
 			rtlsdr_set_freq_correction(dev, ntohl(cmd.param));
 			break;
 		case 0x06:
 			tmp = ntohl(cmd.param);
-			printf("set if stage %d gain %d\n", tmp >> 16, (short)(tmp & 0xffff));
+			ESP_LOGD(TAG, "set if stage %d gain %d", tmp >> 16, (short)(tmp & 0xffff));
 			rtlsdr_set_tuner_if_gain(dev, tmp >> 16, (short)(tmp & 0xffff));
 			break;
 		case 0x07:
-			printf("set test mode %d\n", ntohl(cmd.param));
+			ESP_LOGD(TAG, "set test mode %lu", (unsigned long)ntohl(cmd.param));
 			rtlsdr_set_testmode(dev, ntohl(cmd.param));
 			break;
 		case 0x08:
-			printf("set agc mode %d\n", ntohl(cmd.param));
+			ESP_LOGD(TAG, "set agc mode %lu", (unsigned long)ntohl(cmd.param));
 			rtlsdr_set_agc_mode(dev, ntohl(cmd.param));
 			break;
 		case 0x09:
-			printf("set direct sampling %d\n", ntohl(cmd.param));
+			ESP_LOGD(TAG, "set direct sampling %lu", (unsigned long)ntohl(cmd.param));
 			rtlsdr_set_direct_sampling(dev, ntohl(cmd.param));
 			break;
 		case 0x0a:
-			printf("set offset tuning %d\n", ntohl(cmd.param));
+			ESP_LOGD(TAG, "set offset tuning %lu", (unsigned long)ntohl(cmd.param));
 			rtlsdr_set_offset_tuning(dev, ntohl(cmd.param));
 			break;
 		case 0x0b:
-			printf("set rtl xtal %d\n", ntohl(cmd.param));
+			ESP_LOGD(TAG, "set rtl xtal %lu", (unsigned long)ntohl(cmd.param));
 			rtlsdr_set_xtal_freq(dev, ntohl(cmd.param), 0);
 			break;
 		case 0x0c:
-			printf("set tuner xtal %d\n", ntohl(cmd.param));
+			ESP_LOGD(TAG, "set tuner xtal %lu", (unsigned long)ntohl(cmd.param));
 			rtlsdr_set_xtal_freq(dev, 0, ntohl(cmd.param));
 			break;
 		case 0x0d:
-			printf("set tuner gain by index %d\n", ntohl(cmd.param));
+			ESP_LOGD(TAG, "set tuner gain by index %lu", (unsigned long)ntohl(cmd.param));
 			set_gain_by_index(dev, ntohl(cmd.param));
 			break;
 		case 0x0e:
-			printf("set bias tee %d\n", ntohl(cmd.param));
+			ESP_LOGD(TAG, "set bias tee %lu", (unsigned long)ntohl(cmd.param));
 			rtlsdr_set_bias_tee(dev, (int)ntohl(cmd.param));
 			break;
 		default:
@@ -415,14 +485,14 @@ static void print_memory_info() {
 
 extern "C"  void app_main() {
 	int r, opt, i;
-	char *addr = "127.0.0.1";
+	const char *addr = "127.0.0.1";
 	const char *port = DEFAULT_PORT_STR;
 	int netPort = 1234;
 	uint32_t frequency = 100000000, samp_rate = DEFAULT_SAMPLE_RATE_HZ;
 	struct sockaddr_storage local, remote;
 	struct addrinfo *ai;
 	struct addrinfo *aiHead;
-	struct addrinfo  hints = { 0 };
+	struct addrinfo  hints = {};
 	char hostinfo[256];  //NI_MAXHOST
 	char portinfo[256]; //NI_MAXSERV
 	char remhostinfo[256];  //NI_MAXHOST
@@ -434,7 +504,6 @@ extern "C"  void app_main() {
 	int gain = 0;
 	int ppm_error = 0;
 	int direct_sampling = 0;
-	struct llist *curelem,*prev;
 	pthread_attr_t attr;
 	void *status;
 	struct timeval tv = {1,0};
@@ -448,10 +517,36 @@ extern "C"  void app_main() {
 //	ESP_ERROR_CHECK(uart_driver_install(UART_NUM_0, 256, 0, 0, NULL, 0));
 //	ESP_ERROR_CHECK(uart_set_pin(UART_NUM_0, UART_TX_PIN, UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
 
-	printf("xtrsdr/rtl_tcp_eth_esp32p4 v1.0.3 start\n");  
-	esp_log_level_set("*", ESP_LOG_DEBUG);
+	printf("xtrsdr/rtl_tcp_eth_esp32p4 v1.1.1-mobile start\n");  
+	esp_log_level_set("*", ESP_LOG_INFO);
 
 	print_memory_info();
+
+#ifdef CONFIG_SPIRAM
+	/* Keep the large IQ ring out of scarce internal/DMA SRAM.  USB host
+	 * transfer descriptors and DMA buffers must remain in internal memory. */
+	const size_t iq_ring_bytes = (size_t)IQ_RING_SLOTS * IQ_CHUNK_SIZE;
+	iq_ring = (uint8_t *)heap_caps_malloc(iq_ring_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+	if (iq_ring == NULL) {
+		ESP_LOGE(TAG, "Failed to allocate IQ ring in PSRAM (%u bytes)", (unsigned)iq_ring_bytes);
+		abort();
+	}
+	memset(iq_ring, 0, iq_ring_bytes);
+	ESP_LOGI(TAG, "IQ ring allocated in PSRAM: %u bytes (%u slots x %u)",
+	         (unsigned)iq_ring_bytes, (unsigned)IQ_RING_SLOTS, (unsigned)IQ_CHUNK_SIZE);
+	ESP_LOGI(TAG, "After IQ ring alloc: free PSRAM=%u, free internal=%u",
+	         (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+	         (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+#else
+	/* No PSRAM: allocate the smaller ring from normal heap. */
+	const size_t iq_ring_bytes = (size_t)IQ_RING_SLOTS * IQ_CHUNK_SIZE;
+	iq_ring = (uint8_t *)malloc(iq_ring_bytes);
+	if (iq_ring == NULL) {
+		ESP_LOGE(TAG, "Failed to allocate IQ ring (%u bytes)", (unsigned)iq_ring_bytes);
+		abort();
+	}
+	memset(iq_ring, 0, iq_ring_bytes);
+#endif
 
 	usbhost_begin();
 	vTaskDelay(1000 / portTICK_PERIOD_MS); 
@@ -480,8 +575,33 @@ extern "C"  void app_main() {
     if (eth_port_cnt == 1) {
         // Use ESP_NETIF_DEFAULT_ETH when just one Ethernet interface is used and you don't need to modify
         // default esp-netif configuration parameters.
-        esp_netif_config_t cfg = ESP_NETIF_DEFAULT_ETH();
+        /* Mobile mode: create Ethernet netif as DHCP SERVER, not DHCP client.
+         * Put the static IPv4 configuration into the inherent config BEFORE
+         * esp_netif_new().  This avoids stopping/restarting DHCP around
+         * esp_netif_set_ip_info() and lets esp-netif start the DHCP server
+         * at the normal interface-start event. */
+        esp_netif_ip_info_t ip_info = {};
+        IP4_ADDR(&ip_info.ip, MOBILE_ETH_IP_A, MOBILE_ETH_IP_B, MOBILE_ETH_IP_C, MOBILE_ETH_IP_D);
+        IP4_ADDR(&ip_info.netmask, 255, 255, 255, 0);
+        IP4_ADDR(&ip_info.gw, MOBILE_ETH_IP_A, MOBILE_ETH_IP_B, MOBILE_ETH_IP_C, MOBILE_ETH_IP_D);
+
+        esp_netif_inherent_config_t base_cfg = ESP_NETIF_INHERENT_DEFAULT_ETH();
+        base_cfg.flags = (esp_netif_flags_t)(
+            (base_cfg.flags & (esp_netif_flags_t)~ESP_NETIF_DHCP_CLIENT) |
+            ESP_NETIF_DHCP_SERVER);
+        base_cfg.ip_info = &ip_info;
+
+        esp_netif_config_t cfg = {};
+        cfg.base = &base_cfg;
+        cfg.stack = ESP_NETIF_NETSTACK_DEFAULT_ETH;
         eth_netifs[0] = esp_netif_new(&cfg);
+        if (eth_netifs[0] == NULL) {
+            ESP_LOGE(TAG, "Failed to create Ethernet netif");
+            abort();
+        }
+
+        ESP_LOGI(TAG, "Mobile Ethernet configured: 192.168.50.1/24, DHCP server mode");
+
         eth_netif_glues[0] = esp_eth_new_netif_glue(eth_handles[0]);
         // Attach Ethernet driver to TCP/IP stack
         ESP_ERROR_CHECK(esp_netif_attach(eth_netifs[0], eth_netif_glues[0]));
@@ -489,10 +609,10 @@ extern "C"  void app_main() {
         // Use ESP_NETIF_INHERENT_DEFAULT_ETH when multiple Ethernet interfaces are used and so you need to modify
         // esp-netif configuration parameters for each interface (name, priority, etc.).
         esp_netif_inherent_config_t esp_netif_config = ESP_NETIF_INHERENT_DEFAULT_ETH();
-        esp_netif_config_t cfg_spi = {
-            .base = &esp_netif_config,
-            .stack = ESP_NETIF_NETSTACK_DEFAULT_ETH
-        };
+        esp_netif_config_t cfg_spi = {};
+	cfg_spi.base = &esp_netif_config;
+	cfg_spi.stack = ESP_NETIF_NETSTACK_DEFAULT_ETH;
+
         char if_key_str[10];
         char if_desc_str[10];
         char num_str[3];
@@ -511,7 +631,8 @@ extern "C"  void app_main() {
     }
 
     // Register user defined event handers
-    ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, &eth_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, &eth_event_handler,
+                                               eth_port_cnt == 1 ? eth_netifs[0] : NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &got_ip_event_handler, NULL));
 
     // Start Ethernet driver state machine
@@ -584,7 +705,7 @@ extern "C"  void app_main() {
 	if (r < 0)
 		fprintf(stderr, "WARNING: Failed to set center freq.\n");
 	else
-		fprintf(stderr, "Tuned to %i Hz.\n", frequency);
+		fprintf(stderr, "Tuned to %lu Hz.\n", (unsigned long)frequency);
 
 	if (0 == gain) {
 		 /* Enable automatic gain */
@@ -655,7 +776,7 @@ char addr_str[128];
 	{
 		ESP_LOGE(TAG, "Socket unable to bind: errno %d", errno);
 	}
-	ESP_LOGI(TAG, "Socket binded");
+	ESP_LOGI(TAG, "Socket bound");
 
 ///	
 
@@ -677,6 +798,11 @@ char addr_str[128];
 			} else if(r) {
 				rlen = sizeof(remote);
 				s = accept(listensocket,(struct sockaddr *)&remote, &rlen);
+				if (s >= 0) {
+					int flags = fcntl(s, F_GETFL, 0);
+					if (flags >= 0)
+						fcntl(s, F_SETFL, flags & ~O_NONBLOCK);
+				}
 				break;
 			}
 		}
@@ -686,7 +812,8 @@ char addr_str[128];
 /*		getnameinfo((struct sockaddr *)&remote, rlen,
 			    remhostinfo, NI_MAXHOST,
 			    remportinfo, NI_MAXSERV, NI_NUMERICSERV);*/
-		printf("client accepted!"); // %s %s\n", remhostinfo, remportinfo);
+		printf("client accepted!\n"); // %s %s\n", remhostinfo, remportinfo);
+
 
 		memset(&dongle_info, 0, sizeof(dongle_info));
 		memcpy(&dongle_info.magic, "RTL0", 4);
@@ -717,18 +844,18 @@ char addr_str[128];
 		closesocket(s);
 
 		printf("all threads dead..\n");
-		curelem = ll_buffers;
-		ll_buffers = 0;
-
-		while(curelem != 0) {
-			prev = curelem;
-			curelem = curelem->next;
-			free(prev->data);
-			free(prev);
-		}
+		pthread_mutex_lock(&ll_mutex);
+		iq_ring_head = 0;
+		iq_ring_tail = 0;
+		iq_ring_count = 0;
+		iq_build_len = 0;
+		memset(iq_ring_len, 0, sizeof(iq_ring_len));
+		pthread_mutex_unlock(&ll_mutex);
 
 		do_exit = 0;
 		global_numq = 0;
+		iq_dropped_blocks = 0;
+		iq_completed_chunks = 0;
 	}
 
 out:
